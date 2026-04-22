@@ -82,12 +82,11 @@ def _channel_min(img: np.ndarray) -> np.ndarray:
 
 
 COLOR_VARIANTS: List[Tuple[str, Callable[[np.ndarray], np.ndarray]]] = [
-    ("raw",        lambda x: x),
-    ("CLAHE-L",    lambda x: _clahe_l(x, 3.5)),
-    ("gamma 0.7",  lambda x: _gamma(x, 0.7)),
-    ("gamma 1.4",  lambda x: _gamma(x, 1.4)),
-    ("sat +50%",   lambda x: _sat_boost(x, 1.5)),
-    ("unsharp",    lambda x: _unsharp(x, 1.5)),
+    # Trimmed to the three variants that win most often on our test
+    # fleet. Cuts ~60 % off per-bbox seg inference time on CPU deploys
+    # without losing the edge-finding benefit of channel-min.
+    ("raw",         lambda x: x),
+    ("CLAHE-L",     lambda x: _clahe_l(x, 3.5)),
     ("channel-min", _channel_min),
 ]
 
@@ -319,8 +318,9 @@ def _seg_on_crop_variants(
     # giving the legacy model that view catches edge points the new
     # model misses.
     if legacy_model_path and Path(legacy_model_path).exists():
+        # Keep only the channel-min legacy variant — the raw one
+        # almost never wins and costs a full inference per bbox.
         legacy_variants = [
-            ("legacy v1 (raw)", raw_crop),
             ("legacy v1 (ch-min)", _channel_min(raw_crop.copy())),
         ]
         for legacy_name, variant_crop in legacy_variants:

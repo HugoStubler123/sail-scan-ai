@@ -344,7 +344,7 @@ def _detect_from_keypoints_model(
         return _detect_classical(image, mask)
 
     try:
-        from ultralytics import YOLO
+        from src._model_cache import get_yolo
     except ImportError:
         print("Warning: ultralytics not installed, using classical fallback")
         return _detect_classical(image, mask)
@@ -352,7 +352,9 @@ def _detect_from_keypoints_model(
     min_conf = config.get('min_confidence', 0.3)
     min_kp_conf = config.get('min_keypoint_confidence', 0.3)
 
-    model = YOLO(model_path)
+    model = get_yolo(model_path)
+    if model is None:
+        return _detect_classical(image, mask)
     results = model(image, conf=min_conf, verbose=False)
     r = results[0]
 
@@ -712,12 +714,14 @@ def _get_yolo_bboxes(
         return []
 
     try:
-        from ultralytics import YOLO
+        from src._model_cache import get_yolo
     except ImportError:
         print("Warning: ultralytics not installed")
         return []
 
-    model = YOLO(model_path)
+    model = get_yolo(model_path)
+    if model is None:
+        return []
     results = model(image, conf=min_conf, verbose=False)
     r = results[0]
 
