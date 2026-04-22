@@ -71,6 +71,22 @@ def analyze_sail(
     from src.sail_analysis import build_refined_stripes
     from src.trim_analyst import SailReading
 
+    # ---- Resize large inputs BEFORE anything else ------------------
+    # Cloud tier has 1 GB RAM. A 4000x3000 RGBA photo held in 3-4
+    # intermediate buffers by SAM2 + opencv can blow through that alone.
+    # Downscale so the long side is <= max_side (default 1800 px). 1800
+    # is empirically the sweet spot: SAM2 + YOLO still resolve stripes
+    # cleanly; peak RAM drops by ~4x vs raw 4K input.
+    max_side = int((config.get("pipeline") or {}).get("max_input_side", 1800))
+    h_raw, w_raw = image_bgr.shape[:2]
+    long_side = max(h_raw, w_raw)
+    if long_side > max_side:
+        scale = max_side / float(long_side)
+        new_w = int(round(w_raw * scale))
+        new_h = int(round(h_raw * scale))
+        image_bgr = cv2.resize(image_bgr, (new_w, new_h),
+                                interpolation=cv2.INTER_AREA)
+
     image_rgb_raw = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
     try:
         calib = calibrate_image(image_rgb_raw, method="opencv")

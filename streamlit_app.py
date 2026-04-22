@@ -759,3 +759,12 @@ for idx, uploaded in enumerate(uploaded_files):
     )
 
     st.divider()
+
+    # Release intermediate tensors / figures before the next batch photo
+    # so we don't accumulate RAM on the cloud 1 GB tier.
+    try:
+        from src._model_cache import trim_memory
+        del analysis
+        trim_memory()
+    except Exception:
+        pass
