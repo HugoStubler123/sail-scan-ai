@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# macOS
+.DS_Store
+
+# Outputs / caches
+output/
+*.pdf
+*.html
+.streamlit/secrets.toml

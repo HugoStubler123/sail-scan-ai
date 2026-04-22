@@ -1,0 +1,65 @@
+sam2:
+  model_path: "sam2.1_b.pt"
+  prompt_strategy: "multi_point"
+  grid_size: 5
+  mask_cleanup: true
+
+calibration:
+  method: "anycalib"
+  model_id: "anycalib_pinhole"
+  camera_model: "radial:2"
+  fallback: "opencv"
+  undistort: true
+
+roboflow:
+  enabled: true
+  api_key: "JZq0kunZDTbZ71c9LzOU"
+  workspace: "sailing-project"
+  project: "fleurs-bot"
+  version: 7
+  confidence_pct: 30
+
+detection:
+  method: "ensemble"  # classical, keypoint, bbox_local, hybrid, ensemble, segmentation, roboflow
+  keypoint_model_path: "stripe_keypoints_v1.pt"
+  bbox_model_path: "stripe_bbox_v1.pt"
+  seg_model_path: "models/sail_seg_model.pt"
+  endpoint_model_path: "stripe_endpoints_v2.pt"
+  endpoint_model_fallback: "stripe_endpoints_v1.pt"
+  endpoint_refiner_enabled: true
+  endpoint_min_confidence: 0.05
+  endpoint_imgsz: 1280
+  # Two-stage crop specialist (stripe_endpoint_crop_26x.pt) — refines
+  # each geometric endpoint within a 256 px crop.
+  endpoint_crop_refiner_enabled: true
+  endpoint_crop_model_path: "stripe_endpoint_crop_26x.pt"
+  endpoint_crop_size: 256
+  endpoint_crop_max_offset_px: 60
+  # Polygon-bottom × SAM2 polyline intersection (primary) with
+  # geometric snap fallback.
+  use_polygon_bottom_intersection: true
+  bbox_padding: 0.2
+  min_confidence: 0.3
+  min_keypoint_confidence: 0.3
+
+splender:
+  enabled: true
+  iterations: 200
+  learning_rate: 0.01
+
+pipeline:
+  max_stripes: 7
+  min_stripe_confidence: 0.4
+  headstay_angle_threshold: 60
+  airfoil_prior: true
+
+output:
+  report_dpi: 150
+  overlay_colors:
+    - "#FF3B5C"
+    - "#00D4AA"
+    - "#FFB020"
+    - "#4DA6FF"
+    - "#C77DFF"
+    - "#FF6B9D"
+    - "#00E5FF"
