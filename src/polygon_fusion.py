@@ -353,29 +353,75 @@ def best_kp_for_bbox(
     kp_dets: List[StripeDetection],
     min_points: int = 3,
 ) -> Optional[StripeDetection]:
-    """Build a single StripeDetection from the kp points that lie in ``bbox``.
+    """Build a single StripeDetection from the kp detection best matching ``bbox``.
 
-    All kp detections whose points fall inside the bbox are pooled and
-    returned as one StripeDetection, sorted by x. If multiple kp detections
-    overlap, their points are merged — typically harmless because the
-    bbox already isolates them to one stripe's row.
+    Strategy: find the single kp detection whose y-centroid is closest to
+    the bbox y-center, then use only that detection's points (filtered to
+    those inside the bbox). This prevents merging points from adjacent
+    stripes when bboxes overlap vertically — a failure mode that occurs
+    when the bbox model returns coarse bboxes that span multiple stripe rows.
+
+    Pooling all overlapping kp detections (the previous behaviour) caused
+    stripe merging because YOLO bboxes for horizontal stripes often have
+    overlapping y-ranges, so a bbox at y=138-227 would capture keypoints
+    from both the stripe at mean_y=155 and the stripe at mean_y=196.
     """
-    points, confidences = _kp_in_bbox_points(kp_dets, bbox)
+    if not kp_dets:
+        return None
+
+    x1, y1, x2, y2 = bbox
+    bbox_cy = 0.5 * (y1 + y2)
+    pad = 10.0
+
+    # Step 1: Pick the single kp_det whose centroid y is closest to
+    # the bbox y-center. This isolates each bbox to one physical stripe.
+    best_det: Optional[StripeDetection] = None
+    best_dist = np.inf
+    for det in kp_dets:
+        pts = det.points
+        if pts is None or len(pts) == 0:
+            continue
+        # Only consider detections that have at least one point inside
+        # the bbox (guards against detections from completely different
+        # regions of the sail being selected by centroid alone).
+        inside = (
+            (pts[:, 0] >= x1 - pad)
+            & (pts[:, 0] <= x2 + pad)
+            & (pts[:, 1] >= y1 - pad)
+            & (pts[:, 1] <= y2 + pad)
+        )
+        if inside.sum() == 0:
+            continue
+        cy = float(np.mean(pts[:, 1]))
+        dist = abs(cy - bbox_cy)
+        if dist < best_dist:
+            best_dist = dist
+            best_det = det
+
+    if best_det is None:
+        return None
+
+    # Step 2: Filter to points inside the bbox from the best detection only.
+    pts = best_det.points
+    inside = (
+        (pts[:, 0] >= x1 - pad)
+        & (pts[:, 0] <= x2 + pad)
+        & (pts[:, 1] >= y1 - pad)
+        & (pts[:, 1] <= y2 + pad)
+    )
+    points = pts[inside].astype(np.float32)
+    if best_det.keypoint_confidences is not None and len(best_det.keypoint_confidences) == len(pts):
+        confidences = np.asarray(best_det.keypoint_confidences, dtype=np.float32)[inside]
+    else:
+        confidences = np.full(int(inside.sum()), float(best_det.confidence), dtype=np.float32)
+
     if len(points) < min_points:
         return None
+
     # Sort by x along the stripe
     order = np.argsort(points[:, 0])
     points = points[order]
     confidences = confidences[order]
-
-    # Simple anomaly filter: reject points whose y is > 3 MAD from the median
-    if len(points) >= 5:
-        med_y = np.median(points[:, 1])
-        mad = np.median(np.abs(points[:, 1] - med_y)) + 1e-6
-        keep = np.abs(points[:, 1] - med_y) <= 4.0 * mad
-        if keep.sum() >= min_points:
-            points = points[keep]
-            confidences = confidences[keep]
 
     if len(points) >= 2:
         dx = points[-1, 0] - points[0, 0]
@@ -466,13 +512,8 @@ def seg_on_crop(
     crop[~crop_mask] = 0   # mask out non-sail pixels
 
     try:
-        from src._model_cache import get_yolo
-        model = get_yolo(seg_model_path)
-        if model is None:
-            return None
-        # imgsz=640 halves inference latency vs the default 1024 with
-        # no measurable recall loss on ~300 px crops.
-        res = model(crop, conf=min_conf, verbose=False, imgsz=640)[0]
+        model = YOLO(seg_model_path)
+        res = model(crop, conf=min_conf, verbose=False)[0]
     except Exception:
         return None
     if res.masks is None or len(res.masks.data) == 0:
@@ -528,20 +569,200 @@ def seg_on_crop(
     )
 
 
+def seg_on_crop_all(
+    image_bgr: np.ndarray,
+    sail_mask: np.ndarray,
+    bbox: Tuple[float, float, float, float],
+    seg_model_path: str,
+    pad_ratio: float = 0.08,
+    min_conf: float = 0.10,
+    min_pixels: int = 30,
+    imgsz: int = 1280,
+) -> List[Tuple[Tuple[float, float, float, float], float]]:
+    """Like ``seg_on_crop`` but returns the *image-space* bbox of EVERY
+    instance the seg model produced inside the crop, not just the best.
+
+    Each item in the result is ``((x1, y1, x2, y2), conf)``. Used to
+    decompose a single bbox-model bbox that happens to cover multiple
+    real stripes — the v7 fusion pipeline can then re-process each
+    sub-bbox individually.
+    """
+    try:
+        from ultralytics import YOLO
+    except ImportError:
+        return []
+
+    h, w = image_bgr.shape[:2]
+    x1, y1, x2, y2 = map(int, bbox)
+    pad_x = max(6, int(round((x2 - x1) * pad_ratio)))
+    pad_y = max(6, int(round((y2 - y1) * pad_ratio)))
+    cx1 = max(0, x1 - pad_x); cy1 = max(0, y1 - pad_y)
+    cx2 = min(w, x2 + pad_x); cy2 = min(h, y2 + pad_y)
+    if cx2 - cx1 < 20 or cy2 - cy1 < 8:
+        return []
+    crop = image_bgr[cy1:cy2, cx1:cx2].copy()
+    crop_mask = sail_mask[cy1:cy2, cx1:cx2]
+    crop[~crop_mask] = 0
+
+    try:
+        model = YOLO(seg_model_path)
+        res = model(crop, conf=min_conf, imgsz=imgsz, verbose=False)[0]
+    except Exception:
+        return []
+    if res.masks is None or len(res.masks.data) == 0:
+        return []
+
+    box_confs = (
+        res.boxes.conf.cpu().numpy() if res.boxes is not None
+        else np.full(len(res.masks.data), 0.3)
+    )
+    ch, cw = crop.shape[:2]
+    out: List[Tuple[Tuple[float, float, float, float], float]] = []
+    for i in range(len(res.masks.data)):
+        inst = res.masks.data[i].cpu().numpy().astype(np.uint8)
+        if inst.shape != (ch, cw):
+            inst = cv2.resize(inst, (cw, ch), interpolation=cv2.INTER_NEAREST)
+        inst = (inst > 0) & crop_mask
+        if inst.sum() < min_pixels:
+            continue
+        ys, xs = np.where(inst)
+        if len(xs) < 4:
+            continue
+        ix1, iy1 = int(xs.min() + cx1), int(ys.min() + cy1)
+        ix2, iy2 = int(xs.max() + cx1), int(ys.max() + cy1)
+        out.append((
+            (float(ix1), float(iy1), float(ix2), float(iy2)),
+            float(box_confs[i]) if i < len(box_confs) else 0.3,
+        ))
+    return out
+
+
+def seg_on_full_sail(
+    image_bgr: np.ndarray,
+    sail_mask: np.ndarray,
+    seg_model_path: str,
+    min_conf: float = 0.10,
+    pad_ratio: float = 0.04,
+    imgsz: int = 1280,
+    min_pixels: int = 80,
+) -> List[StripeDetection]:
+    """Run the YOLO seg model on the **full** sail bounding-box (not a
+    per-stripe crop). Returns every instance mask the model produced.
+
+    Each mask becomes a ``StripeDetection`` with ``polygon`` (contour) and
+    ``points`` (skeleton-traced centerline). Use this when bbox / kp
+    detectors fail to enumerate stripes — the seg model can find them
+    directly.
+    """
+    try:
+        from ultralytics import YOLO
+        from skimage.morphology import skeletonize
+    except ImportError:
+        return []
+
+    H, W = image_bgr.shape[:2]
+    ys, xs = np.where(sail_mask.astype(bool))
+    if len(ys) < 100:
+        return []
+    x1 = int(xs.min()); x2 = int(xs.max())
+    y1 = int(ys.min()); y2 = int(ys.max())
+    pad_x = max(8, int(round((x2 - x1) * pad_ratio)))
+    pad_y = max(8, int(round((y2 - y1) * pad_ratio)))
+    cx1 = max(0, x1 - pad_x); cy1 = max(0, y1 - pad_y)
+    cx2 = min(W, x2 + pad_x); cy2 = min(H, y2 + pad_y)
+
+    crop = image_bgr[cy1:cy2, cx1:cx2].copy()
+    crop_mask = sail_mask[cy1:cy2, cx1:cx2]
+    crop[~crop_mask] = 0
+
+    try:
+        model = YOLO(seg_model_path)
+        res = model(crop, conf=min_conf, imgsz=imgsz, verbose=False)[0]
+    except Exception:
+        return []
+    if res.masks is None or len(res.masks.data) == 0:
+        return []
+
+    box_confs = (
+        res.boxes.conf.cpu().numpy() if res.boxes is not None
+        else np.full(len(res.masks.data), 0.3)
+    )
+    ch, cw = crop.shape[:2]
+    detections: List[StripeDetection] = []
+    for i in range(len(res.masks.data)):
+        inst = res.masks.data[i].cpu().numpy().astype(np.uint8)
+        if inst.shape != (ch, cw):
+            inst = cv2.resize(inst, (cw, ch), interpolation=cv2.INTER_NEAREST)
+        inst = (inst > 0) & crop_mask
+        if inst.sum() < min_pixels:
+            continue
+
+        contours, _ = cv2.findContours(
+            inst.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_KCOS,
+        )
+        polygon = None
+        if contours:
+            largest = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(largest) >= 40:
+                polygon = (largest.reshape(-1, 2).astype(np.float32)
+                            + np.array([cx1, cy1], dtype=np.float32))
+
+        sk = skeletonize(inst)
+        sy, sx = np.where(sk)
+        if len(sx) < 6:
+            continue
+        pts = np.column_stack([sx + cx1, sy + cy1]).astype(np.float32)
+        order = np.argsort(pts[:, 0])
+        pts = pts[order]
+        n_sample = min(14, len(pts))
+        idx = np.linspace(0, len(pts) - 1, n_sample).astype(int)
+        pts = pts[idx]
+
+        dx_ = pts[-1, 0] - pts[0, 0]
+        dy_ = pts[-1, 1] - pts[0, 1]
+        orient = (
+            np.arctan(dy_ / dx_) * 180.0 / np.pi if abs(dx_) > 1e-6 else 90.0
+        )
+        detections.append(StripeDetection(
+            points=pts,
+            confidence=float(box_confs[i]) if i < len(box_confs) else 0.3,
+            orientation_deg=float(orient),
+            polygon=polygon,
+        ))
+
+    return detections
+
+
 def dedup_bboxes(
     bboxes: List[np.ndarray],
     iou_threshold: float = 0.35,
     y_center_tol_ratio: float = 0.25,
+    min_height_px: float = 8.0,
 ) -> List[np.ndarray]:
     """Remove overlapping / stacked bboxes.
 
     Two bboxes collapse if:
-      * their IoU exceeds ``iou_threshold``, OR
+      * their IoU exceeds ``iou_threshold``, AND they pass the height-ratio
+        guard (a small box whose center is outside the central band of a
+        large box represents a different stripe — don't merge them), OR
       * their centers are vertically within ``y_center_tol_ratio`` of the
-        taller box's height AND they overlap horizontally by ≥ 40 %.
+        smaller box's height AND they overlap horizontally by ≥ 40 %.
 
     Keeps the bbox with the larger area (more likely the primary stripe).
+
+    Tiny-bbox pre-filter: bboxes with H < ``min_height_px`` are dropped
+    immediately — they cannot correspond to a real stripe.
+
+    Height-ratio guard: when one bbox is much taller than the other
+    (height_ratio > 1.8), the smaller box may represent an individual stripe
+    that the taller box mistakenly spans.  We only merge on IoU if the
+    smaller box's y-center falls within the central 60 % of the larger
+    box's y-range — i.e. |cy_small - cy_large| / h_large ≤ 0.20.
+    This prevents a "contaminated" wide detection from absorbing a
+    narrower detection pointing at a distinct adjacent stripe.
     """
+    # Drop tiny fragment bboxes that can never correspond to a real stripe
+    bboxes = [b for b in bboxes if (b[3] - b[1]) >= min_height_px]
     if len(bboxes) <= 1:
         return bboxes
 
@@ -555,10 +776,40 @@ def dedup_bboxes(
         ua = _area(a) + _area(b) - inter
         return inter / ua if ua > 0 else 0.0
 
+    def _height_ratio_guard_ok(a: np.ndarray, b: np.ndarray) -> bool:
+        """Return True if the y-centers are close enough that IoU-based
+        merging is safe (both boxes point at the same stripe).
+
+        The guard fires when one box is significantly taller than the other
+        AND the y-centers are more than half the smaller box's height apart.
+        This catches contaminated wide-bbox detections (one YOLO box
+        spanning two physical stripes) that would otherwise absorb a
+        smaller, stripe-specific detection via IoU.
+
+        Specifically: if ``|cy_a - cy_b| > h_small * 0.60`` and the height
+        ratio is > 1.5, the two boxes are assumed to anchor different
+        stripes → merge is vetoed.
+        """
+        ha = a[3] - a[1]
+        hb = b[3] - b[1]
+        if ha < 1 or hb < 1:
+            return True
+        h_large = max(ha, hb)
+        h_small = min(ha, hb)
+        if h_large / h_small <= 1.5:
+            return True  # similar heights — normal IoU merge is safe
+        cy_a = 0.5 * (a[1] + a[3])
+        cy_b = 0.5 * (b[1] + b[3])
+        # Veto merge when y-centers are farther apart than 30% of small height
+        return abs(cy_a - cy_b) <= h_small * 0.30
+
     def _y_cluster(a, b):
         cy_a = 0.5 * (a[1] + a[3])
         cy_b = 0.5 * (b[1] + b[3])
-        h = max(a[3] - a[1], b[3] - b[1])
+        # Use the SMALLER box's height so a single tall noise box (which
+        # the bbox model produces at low confidence) does not swallow
+        # genuine slim stripe boxes whose centres happen to fall inside it.
+        h = min(a[3] - a[1], b[3] - b[1])
         if h < 1:
             return False
         if abs(cy_a - cy_b) > h * y_center_tol_ratio:
@@ -578,7 +829,11 @@ def dedup_bboxes(
             j = order[pj]
             if not keep[j]:
                 continue
-            if _iou(bboxes[i], bboxes[j]) > iou_threshold or _y_cluster(bboxes[i], bboxes[j]):
+            iou_merge = (
+                _iou(bboxes[i], bboxes[j]) > iou_threshold
+                and _height_ratio_guard_ok(bboxes[i], bboxes[j])
+            )
+            if iou_merge or _y_cluster(bboxes[i], bboxes[j]):
                 # Keep the larger one
                 if _area(bboxes[j]) > _area(bboxes[i]):
                     keep[i] = False

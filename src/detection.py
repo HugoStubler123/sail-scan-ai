@@ -344,18 +344,17 @@ def _detect_from_keypoints_model(
         return _detect_classical(image, mask)
 
     try:
-        from src._model_cache import get_yolo
+        from ultralytics import YOLO
     except ImportError:
         print("Warning: ultralytics not installed, using classical fallback")
         return _detect_classical(image, mask)
 
     min_conf = config.get('min_confidence', 0.3)
     min_kp_conf = config.get('min_keypoint_confidence', 0.3)
+    imgsz = int(config.get('keypoint_imgsz', 640))
 
-    model = get_yolo(model_path)
-    if model is None:
-        return _detect_classical(image, mask)
-    results = model(image, conf=min_conf, verbose=False)
+    model = YOLO(model_path)
+    results = model(image, conf=min_conf, imgsz=imgsz, verbose=False)
     r = results[0]
 
     if r.keypoints is None or len(r.keypoints.data) == 0:
@@ -695,7 +694,8 @@ def _detect_bbox_local(
 def _get_yolo_bboxes(
     image: np.ndarray,
     model_path: str,
-    min_conf: float = 0.3
+    min_conf: float = 0.3,
+    imgsz: int = 640,
 ) -> List[np.ndarray]:
     """Run YOLO bbox detection and return sorted bounding boxes.
 
@@ -714,28 +714,30 @@ def _get_yolo_bboxes(
         return []
 
     try:
-        from src._model_cache import get_yolo
+        from ultralytics import YOLO
     except ImportError:
         print("Warning: ultralytics not installed")
         return []
 
-    model = get_yolo(model_path)
-    if model is None:
-        return []
-    results = model(image, conf=min_conf, verbose=False)
+    model = YOLO(model_path)
+    results = model(image, conf=min_conf, imgsz=imgsz, verbose=False)
     r = results[0]
 
     if r.boxes is None or len(r.boxes) == 0:
         return []
 
+    H, W = image.shape[:2]
+    max_h = 0.6 * H              # taller than 60% of image isn't a stripe
+
     bboxes = []
     for i in range(len(r.boxes)):
         box = r.boxes.xyxy[i].cpu().numpy()  # [x1, y1, x2, y2]
+        bh = float(box[3] - box[1])
+        if bh > max_h or bh < 1:
+            continue
         bboxes.append(box)
 
-    # Sort by y-center (top to bottom)
     bboxes.sort(key=lambda b: (b[1] + b[3]) / 2)
-
     return bboxes
 
 

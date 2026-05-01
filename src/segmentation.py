@@ -232,31 +232,51 @@ def _find_best_mask_multipoint(
     return best_mask
 
 
-def _refine_sail_mask(mask: np.ndarray, cleanup_kernel_pct: float = 2.5) -> np.ndarray:
+def _refine_sail_mask(
+    mask: np.ndarray,
+    cleanup_kernel_pct: float = 2.5,
+    fill_kernel_pct: float = 12.0,
+    fill_top_concavities: bool = False,
+    top_band_frac: float = 0.08,
+) -> np.ndarray:
     """Clean up sail mask with morphological operations.
 
-    Removes rigging/stays with opening, keeps largest component, fills holes.
+    Removes rigging/stays with opening, keeps largest component, fills
+    inward notches with an aggressive closing pass. The close kernel is
+    sized independently so it can fill larger holes (e.g. SAM artefacts
+    where it grabs sky/headboard hardware in the upper sail) without
+    affecting the open kernel that strips rigging.
 
     Args:
         mask: Binary mask (H, W) bool
-        cleanup_kernel_pct: Kernel size as % of image diagonal
+        cleanup_kernel_pct: Open kernel size as % of image diagonal
+            (controls how thin a protrusion is removed; bigger = strips
+            more rigging but also nibbles the sail edge).
+        fill_kernel_pct: Close kernel size as % of image diagonal
+            (controls how wide a notch can be filled; bigger = fills
+            larger SAM notches but may bridge gaps to neighbouring sails).
 
     Returns:
         Refined binary mask (H, W) bool
     """
     h, w = mask.shape
     diagonal = np.sqrt(h**2 + w**2)
-    kernel_size = max(3, int(diagonal * cleanup_kernel_pct / 100.0))
-    # Ensure odd
-    if kernel_size % 2 == 0:
-        kernel_size += 1
+
+    def _odd_kernel(pct: float) -> int:
+        k = max(3, int(diagonal * pct / 100.0))
+        return k + 1 if k % 2 == 0 else k
+
+    open_size = _odd_kernel(cleanup_kernel_pct)
+    close_size = _odd_kernel(fill_kernel_pct)
 
     mask_uint8 = mask.astype(np.uint8)
     original_area = np.sum(mask_uint8)
 
     # Morphological opening (removes thin protrusions like rigging)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-    opened = cv2.morphologyEx(mask_uint8, cv2.MORPH_OPEN, kernel)
+    open_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (open_size, open_size)
+    )
+    opened = cv2.morphologyEx(mask_uint8, cv2.MORPH_OPEN, open_kernel)
 
     # Keep largest connected component
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(opened, connectivity=8)
@@ -273,13 +293,66 @@ def _refine_sail_mask(mask: np.ndarray, cleanup_kernel_pct: float = 2.5) -> np.n
     if cleaned_area < 0.7 * original_area:
         return mask
 
-    # Morphological closing (fill small holes)
+    # Morphological closing (fill inward notches in the sail boundary)
     close_kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (kernel_size // 2 + 1, kernel_size // 2 + 1)
+        cv2.MORPH_ELLIPSE, (close_size, close_size)
     )
     cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, close_kernel)
 
+    # Convex-hull pass on the top band to fill notches the close kernel
+    # cannot reach. Sails are convex above the tack-clew foot line — any
+    # inward concavity in this band is a SAM artefact (sky bleed,
+    # headboard hardware, mast/boom shadow). The bottom 70% is left
+    # untouched so concave foot curves on mainsails survive.
+    if fill_top_concavities:
+        cleaned = _fill_concavities_in_top_band(cleaned, top_band_frac)
+
     return cleaned.astype(bool)
+
+
+def _fill_concavities_in_top_band(mask: np.ndarray, top_band_frac: float) -> np.ndarray:
+    """Replace the upper portion of the mask with its convex hull, leave
+    the lower portion (foot) untouched.
+
+    Args:
+        mask: uint8 binary mask (H, W)
+        top_band_frac: fraction of the mask's vertical extent (from top)
+            to convex-hullify. 0.30 means top 30 % of the sail's bounding
+            rows.
+    """
+    if mask is None or mask.size == 0:
+        return mask
+    rows = np.where(mask.any(axis=1))[0]
+    if len(rows) < 2:
+        return mask
+    top_row, bot_row = int(rows[0]), int(rows[-1])
+    extent = bot_row - top_row
+    if extent < 10:
+        return mask
+    cutoff_row = top_row + int(top_band_frac * extent)
+
+    # Carve out the upper band, take its convex hull, paste back
+    upper = mask.copy()
+    upper[cutoff_row + 1 :, :] = 0
+    if not upper.any():
+        return mask
+    ys, xs = np.where(upper)
+    pts = np.column_stack([xs, ys]).astype(np.int32)
+    if len(pts) < 3:
+        return mask
+    try:
+        hull = cv2.convexHull(pts)
+    except cv2.error:
+        return mask
+    hull_mask = np.zeros_like(mask)
+    cv2.fillPoly(hull_mask, [hull], 1)
+    # Restrict the hull fill to the upper band only — anything below the
+    # cutoff comes from the original mask, untouched.
+    out = mask.copy()
+    out[: cutoff_row + 1, :] = np.maximum(
+        mask[: cutoff_row + 1, :], hull_mask[: cutoff_row + 1, :]
+    )
+    return out
 
 
 def segment_sail(
@@ -477,6 +550,54 @@ def extract_boundary(mask: np.ndarray) -> SailBoundary:
             contour = longest_seg
         contour[:, 0] = np.clip(contour[:, 0], 0, w_mask - 1)
         contour[:, 1] = np.clip(contour[:, 1], 0, h_mask - 1)
+
+        # Mask-fills-frame fix: when the sail extends below the visible
+        # head ridge (i.e. the bottom of the mask is far below the kept
+        # contour), the cropped head-ridge segment alone gives degenerate
+        # polylines. Extend the contour by tracing the leftmost/rightmost
+        # mask pixel in each row from the head-ridge endpoints down to the
+        # bottom of the mask. This produces an OPEN contour spanning
+        # bottom-left → head → bottom-right, so split_contour_luff_leech
+        # places tack/clew at the bottom of the visible sail and the luff/
+        # leech polylines run down the sides of the mask.
+        ys_mask, xs_mask = np.where(mask)
+        if len(ys_mask) > 0:
+            y_max_mask = int(ys_mask.max())
+            ridge_y_max = float(contour[:, 1].max())
+            if (y_max_mask - ridge_y_max) > 0.15 * h_mask:
+                order = np.argsort(contour[:, 0])
+                head_ridge = contour[order]
+                y_left = float(head_ridge[0, 1])
+                y_right = float(head_ridge[-1, 1])
+
+                left_pts = []
+                for yi in range(int(y_left) + 1, y_max_mask + 1):
+                    row = mask[yi]
+                    if row.any():
+                        left_pts.append([int(np.argmax(row)), yi])
+                right_pts = []
+                for yi in range(int(y_right) + 1, y_max_mask + 1):
+                    row = mask[yi]
+                    if row.any():
+                        right_pts.append([
+                            int(len(row) - 1 - np.argmax(row[::-1])),
+                            yi,
+                        ])
+
+                left_arr = (np.array(left_pts, dtype=np.float64)
+                            if left_pts else np.empty((0, 2)))
+                right_arr = (np.array(right_pts, dtype=np.float64)
+                             if right_pts else np.empty((0, 2)))
+
+                parts = []
+                if len(left_arr):
+                    parts.append(left_arr[::-1])  # bottom -> top
+                parts.append(head_ridge)           # left -> right
+                if len(right_arr):
+                    parts.append(right_arr)        # top -> bottom
+                contour = np.vstack(parts)
+                contour[:, 0] = np.clip(contour[:, 0], 0, w_mask - 1)
+                contour[:, 1] = np.clip(contour[:, 1], 0, h_mask - 1)
 
     # Split into luff, leech, and foot
     luff_polyline, leech_polyline, foot_polyline, head_point, tack_point, clew_point = \
