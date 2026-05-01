@@ -58,6 +58,7 @@ def analyze_sail(
     from src.segmentation import segment_sail
     from src.sail_shape import (
         head_from_mask, analyze_sail_edges, resplit_luff_leech_at_head,
+        detect_sail_orientation,
     )
     from src.detection import _detect_from_keypoints_model, _get_yolo_bboxes
     from src.polygon_fusion import dedup_bboxes
@@ -95,8 +96,30 @@ def analyze_sail(
         image_rgb = image_rgb_raw
     image_bgr_use = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
 
-    # Segmentation
+    # ---- Auto-rotation: orient the photo so the sail head is at the top.
+    # Same logic as build_cape31_v7_real.py — segment once, classify
+    # orientation from the mask, rotate the image, then re-segment on the
+    # corrected image so all downstream stages (head/tack/clew, stripe
+    # detection) work on a head-up frame.
     sam2_cfg = config.get("sam2", {})
+    pre_sail = segment_sail(
+        image_rgb,
+        model_path=sam2_cfg.get("model_path", "sam2.1_b.pt"),
+        prompt_strategy=sam2_cfg.get("prompt_strategy", "multi_point"),
+        grid_size=sam2_cfg.get("grid_size", 5),
+        mask_cleanup=sam2_cfg.get("mask_cleanup", True),
+    )
+    rot_code = detect_sail_orientation(pre_sail.mask)
+    rot_map = {
+        1: cv2.ROTATE_90_COUNTERCLOCKWISE,
+        2: cv2.ROTATE_180,
+        3: cv2.ROTATE_90_CLOCKWISE,
+    }
+    if rot_code in rot_map:
+        image_rgb = cv2.rotate(image_rgb, rot_map[rot_code])
+        image_bgr_use = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
+
+    # Final segmentation on the head-up image
     sail = segment_sail(
         image_rgb,
         model_path=sam2_cfg.get("model_path", "sam2.1_b.pt"),
