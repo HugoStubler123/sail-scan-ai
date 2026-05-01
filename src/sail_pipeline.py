@@ -361,27 +361,18 @@ def analyze_sail(
         image_bgr_use, cv2.COLOR_BGR2GRAY,
     )
 
-    # ---- Enriched bbox source (mirrors _enriched_get_yolo_bboxes) ----
-    bboxes = _build_enriched_bboxes(
-        image_bgr_use, sail.mask, det_cfg, sail_type,
-    )
-
-    # ---- Keypoint detections with top-crop recovery for mains --------
+    # ---- Bboxes + keypoints (canonical capture_sail pipeline) ---------
+    # Cape31-style enrichments (kp-synth, seg-decompose, cluster-synth,
+    # top-crop kp recovery) are intentionally NOT used here: empirically
+    # they over-detect on test_photo / general user uploads and produce
+    # mis-oriented stripes (bottom stripe flipped on J2 mainsail). Stay
+    # on the same simple bbox + kp path that build_v7_report.py uses.
+    bbox_model = det_cfg.get("bbox_model_path", "stripe_bbox_v1.pt")
+    bboxes = dedup_bboxes(_get_yolo_bboxes(
+        image_bgr_use, bbox_model,
+        min_conf=float(det_cfg.get("min_confidence", 0.3)),
+    ))
     kp_dets = _detect_from_keypoints_model(image_bgr_use, sail.mask, det_cfg)
-    if sail_type == "main":
-        try:
-            top_dets = detect_kp_on_top_crop(
-                image_bgr_use, sail.mask, det_cfg,
-                _detect_from_keypoints_model,
-                top_frac=0.40, target_size=1280, min_conf_override=0.10,
-            )
-            if top_dets:
-                logger.info(
-                    "top-crop kp recovered %d extra detections", len(top_dets),
-                )
-            kp_dets = list(kp_dets) + list(top_dets)
-        except Exception as exc:
-            logger.warning("top-crop kp pass failed: %s", exc)
 
     # Detection (D-F) — run once
     seg_path = det_cfg.get("seg_model_path", "../models/sail_seg_model.pt")
