@@ -146,21 +146,11 @@ def analyze_sail(
     # Spline fit + SAM intersection + refit (I)
     results = fit_and_intersect(detections_with_ep, sail)
 
-    # CST airfoil fit per stripe (for the aero tab & PDF)
-    cst_splines = []
-    for r in results:
-        if r.spline_points is None or r.detection.points is None:
-            cst_splines.append(None)
-            continue
-        try:
-            _, _, cst = fit_cst_airfoil(
-                r.detection.points, r.luff_ep, r.leech_ep,
-                n_shape=4, reg=0.001,
-                keypoint_confidences=r.detection.keypoint_confidences,
-            )
-            cst_splines.append(cst)
-        except Exception:
-            cst_splines.append(None)
+    # The new canonical fit (consensus spline anchored at fused endpoints)
+    # already lives in r.spline_points after fit_and_intersect. Pass it
+    # through as cst_splines so the streamlit overlay renders the
+    # consensus curve instead of an ad-hoc CST refit.
+    cst_splines = [r.spline_points for r in results]
 
     # Aero params + refined stripes
     stripe_data = [
